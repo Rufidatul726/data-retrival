@@ -1,137 +1,150 @@
-const splGovernanceModule = await import('@solana/spl-governance');
+// fetch_proposals_from_realms.js
 import fs from 'fs';
-const { getAllProposals } = splGovernanceModule;
+import path from 'path';
 
+const splGovernanceModule = await import('@solana/spl-governance');
 const solanaWeb3 = await import('@solana/web3.js');
+const { getAllProposals } = splGovernanceModule;
 const { Connection, PublicKey } = solanaWeb3;
 
-const RPC_URL = 'https://lb.drpc.org/solana/AnB81nqFRk-OvTFykc2CC9gEj9iXiPoR8IlRqhnKxixj';
-const connection = new Connection(RPC_URL, 'recent');
+// === Config ===
+const RPC_URL = 'https://devnet.helius-rpc.com/';
+const COMMITMENT = 'confirmed';
+const DEPLOYMENTS_DIR = 'output_deployments_2025_10_4'; // input realms
+const BASE_DATE = new Date(2025, 9, 3);
+const OUTPUT_DIR = `output_proposals_${BASE_DATE.getFullYear()}_${BASE_DATE.getMonth() + 1}_${BASE_DATE.getDate()}`;
 
-const FAILED_FILE = "failed_realms.json";
-
-// make an output directory based on the date
-const date = new Date(2025, 7, 27);
-const outputDir = `output_proposals_${date.getFullYear()}_${date.getMonth()+1}_${date.getDate()}`;
-// make the output directory if it doesn't exist
-if (!fs.existsSync(outputDir)) {
-    fs.mkdirSync(outputDir);
+if (!fs.existsSync(OUTPUT_DIR)) {
+  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 }
 
-// helper: append failed realm to file
-function recordFailedRealm(programId, realmPubKey) {
-    let failed = [];
-    if (fs.existsSync(FAILED_FILE)) {
-        try {
-            failed = JSON.parse(fs.readFileSync(FAILED_FILE, "utf-8"));
-        } catch (e) {
-            console.error("⚠️ Could not parse failed_realms.json, overwriting.");
-            failed = [];
-        }
-    }
-    failed.push({ programId: programId.toString(), realmPubKey: realmPubKey.toString() });
-    fs.writeFileSync(FAILED_FILE, JSON.stringify(failed, null, 2));
-}
+console.log('RPC:', RPC_URL);
+console.log('Using commitment:', COMMITMENT);
 
-const getProposalsForRealm = async (
-    connection,
-    programIdAsString,
-    realmPublicKeyAsString
-) => {
-    const programId = new PublicKey(programIdAsString);
-    const realmPubKey = new PublicKey(realmPublicKeyAsString);
+// === Helpers ===
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-    const filename = `${outputDir}/${programId}_${realmPubKey}_proposals.json`;
-    if (fs.existsSync(filename)) {
-        console.log('  skipping', programId.toString(), realmPubKey.toString());
-        return;
-    }
-
-    // Increase delay to 2 seconds
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    // Increase delay to 2 seconds
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    // Increase delay to 2 seconds
-    await new Promise(resolve => setTimeout(resolve, 2000));
-
-    let realmProposals = null;
-    let numTries = 0;
-    const maxRetries = 10;
-
-    while (numTries < maxRetries) {
-        try {
-            realmProposals = await getAllProposals(connection, programId, realmPubKey);
-            console.log(realmProposals);
-            break; // success
-        } catch (e) {
-            numTries++;
-            const baseDelay = Math.pow(2, numTries) * 500;
-            const jitter = Math.floor(Math.random() * 500);
-            const delay = baseDelay + jitter;
-
-            console.log(
-                `error fetching proposals (try ${numTries}/${maxRetries})`,
-                e.message || e,
-                `→ retrying after ${delay}ms`
-            );
-
-            await new Promise(resolve => setTimeout(resolve, delay));
-        }
-    }
-
-    if (!realmProposals) {
-        console.log('❌ failed to fetch proposals for', programId.toString(), realmPubKey.toString());
-        recordFailedRealm(programId, realmPubKey); // 🔥 record failure
-        return;
-    }
-
-    // convert BigNumber to number
-    realmProposals.forEach(solanaGovernance => {
-        solanaGovernance.forEach(proposal => {
-            if (proposal.account.votingCompletedAt) {
-                proposal.account.votingCompletedAt = proposal.account.votingCompletedAt.toNumber();
-            }
-        });
-    });
-
-    fs.writeFileSync(filename, JSON.stringify(realmProposals, null, 2));
-    console.log('✅ finished', programId.toString(), realmPubKey.toString());
-};
-
-
-// 1. get all of the program ids from program_ids.txt
-const programIds = fs.readFileSync('program_ids.txt', 'utf-8')
-    .split('\n')
-    .map(id => id.trim())
-    .filter(id => id.length > 0);
-
-// 2. get all of the realms for each program id from the output dir
-const allRealms = [];
-const deployments_output_dir = 'output_deployments_2025_7_22';
-for (let i = 0; i < programIds.length; i++) {
-    var programId = programIds[i];
-    var filename = `${deployments_output_dir}/${programId}_realms.json`;
-    var programRealms = JSON.parse(fs.readFileSync(filename, 'utf-8'));
-    // append to realms
-    allRealms.push(...programRealms);
-}
-console.log('got', allRealms.length, 'realms in total');
-
-// 3. get all of the proposals for each realm async
-for (let i = 0; i < allRealms.length; i++) {
-    var realm = allRealms[i];
-    var programId = realm.owner;
-    var realmPubKeyString = realm.pubkey;
-    console.log('running', programId, realmPubKeyString, i);
+// Retry wrapper with exponential backoff
+async function withRetry(fn, retries = 5, delay = 60000) {
+  let lastError;
+  for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-        await getProposalsForRealm(
-            connection,
-            programId,
-            realmPubKeyString
-        );
-    } catch (e) {
-        console.log('Failed for realm', realmPubKeyString, 'Error:', e);
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      console.warn(`Attempt ${attempt} failed: ${err.message}`);
+      if (attempt < retries) {
+        const wait = delay * Math.pow(2, attempt - 1);
+        console.log(`Retrying in ${wait / 1000}s...`);
+        await sleep(wait);
+      }
     }
-    // Increase delay to 2 seconds
-    // await new Promise(resolve => setTimeout(resolve, 2000));
+  }
+  throw lastError;
 }
+
+// === Proposal fetch ===
+async function getProposalsForRealm(connection, programIdStr, realmPubkeyStr) {
+  const programId = new PublicKey(programIdStr);
+  const realmPubkey = new PublicKey(realmPubkeyStr);
+
+  const outputFile = path.join(OUTPUT_DIR, `${programId}_${realmPubkey}_proposals.json`);
+  if (fs.existsSync(outputFile)) {
+    console.log('  skipping (exists)', programIdStr, realmPubkeyStr);
+    return;
+  }
+
+  try {
+    const realmProposals = await withRetry(
+      () => getAllProposals(connection, programId, realmPubkey),
+      10, // retries
+      60000 // start delay
+    );
+
+    // Normalize numeric fields
+    realmProposals.forEach(group =>
+      group.forEach(proposal => {
+        if (proposal.account?.votingCompletedAt) {
+          proposal.account.votingCompletedAt = proposal.account.votingCompletedAt.toNumber();
+        }
+      })
+    );
+
+    fs.writeFileSync(outputFile, JSON.stringify(realmProposals, null, 2));
+    console.log('  ✅ finished', programIdStr, realmPubkeyStr);
+  } catch (err) {
+    console.error('  ❌ failed', programIdStr, realmPubkeyStr, '-', err.message);
+    const failedFile = path.join(OUTPUT_DIR, 'failed_proposals.json');
+    let failedList = [];
+    if (fs.existsSync(failedFile)) {
+      try {
+        failedList = JSON.parse(fs.readFileSync(failedFile, 'utf-8'));
+      } catch {}
+    }
+    failedList.push({ programId: programIdStr, realmPubkey: realmPubkeyStr, error: err.message });
+    fs.writeFileSync(failedFile, JSON.stringify(failedList, null, 2));
+  }
+}
+
+// === Main logic ===
+const connection = new Connection(RPC_URL, COMMITMENT);
+
+// Load program IDs
+const programIds = fs.readFileSync('program_ids.txt', 'utf-8')
+  .split('\n')
+  .map(id => id.trim())
+  .filter(id => id.length > 0);
+
+console.log('Loaded', programIds.length, 'program IDs');
+
+// Load realms from deployment outputs
+let allRealms = [];
+for (const programId of programIds) {
+  const file = path.join(DEPLOYMENTS_DIR, `${programId}_realms.json`);
+  if (!fs.existsSync(file)) {
+    console.warn('Warning: file not found', file);
+    continue;
+  }
+
+  const data = JSON.parse(fs.readFileSync(file, 'utf-8'));
+  if (Array.isArray(data)) {
+    allRealms.push(...data.map(r => ({ ...r, owner: programId })));
+  }
+}
+
+console.log('Total realms loaded:', allRealms.length);
+
+// === Fetch proposals ===
+let processed = 0;
+for (const realm of allRealms) {
+  const programId = realm.owner;
+  const realmPubkey = realm.pubkey;
+
+  if (!realm.account) {
+    console.log('Skipping (no account):', programId, realmPubkey);
+    continue;
+  }
+
+  // Skip if no proposals
+  const proposalCount = realm.account.votingProposalCount ?? 0;
+  if (proposalCount === 0) {
+    console.log('Skipping (no proposals):', programId, realmPubkey);
+    continue;
+  }
+
+  const outputFile = path.join(OUTPUT_DIR, `${programId}_${realmPubkey}_proposals.json`);
+  if (fs.existsSync(outputFile)) {
+    console.log('Skipping (already saved):', programId, realmPubkey);
+    continue;
+  }
+
+  console.log(`Fetching proposals for realm ${realmPubkey} [${processed + 1}/${allRealms.length}]`);
+  await getProposalsForRealm(connection, programId, realmPubkey);
+
+  processed++;
+  console.log(`⏳ Waiting 60s before next...`);
+  await sleep(60000);
+}
+
+console.log('\n=== DONE ===');
+console.log(`Processed ${processed} realms with proposals`);
